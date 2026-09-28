@@ -164,7 +164,14 @@ class DiarizationPipeline:
         if progress_callback is not None:
             progress_callback(100.0)
 
-        diarization = output.speaker_diarization
+        # Prefer the exclusive annotation: it has no overlapping speech turns,
+        # which is what we want when assigning one speaker per transcript
+        # segment. Embeddings stay indexed off the non-exclusive annotation,
+        # which is the order pyannote returns them in.
+        label_source = output.speaker_diarization
+        diarization = output.exclusive_speaker_diarization
+        if diarization is None:
+            diarization = label_source
         embeddings = output.speaker_embeddings if return_embeddings else None
 
         diarize_df = pd.DataFrame(diarization.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
@@ -172,7 +179,8 @@ class DiarizationPipeline:
         diarize_df['end'] = diarize_df['segment'].apply(lambda x: x.end)
 
         if return_embeddings and embeddings is not None:
-            speaker_embeddings = {speaker: embeddings[s].tolist() for s, speaker in enumerate(diarization.labels())}
+            # embeddings are ordered by label_source.labels()
+            speaker_embeddings = {speaker: embeddings[s].tolist() for s, speaker in enumerate(label_source.labels())}
             return diarize_df, speaker_embeddings
         
         # For backwards compatibility
