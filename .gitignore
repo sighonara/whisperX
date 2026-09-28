@@ -169,3 +169,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Generated transcripts. Large and reproducible from the source audio.
+outputs/
+.idea/
+.DS_Store
