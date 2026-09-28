@@ -410,6 +410,41 @@ class WriteTSV(ResultWriter):
             print(round(1000 * segment["end"]), file=file, end="\t")
             print(segment["text"].strip().replace("\t", " "), file=file, flush=True)
 
+class WriteSPK(ResultWriter):
+    extension: str = "spk.txt"
+
+    @staticmethod
+    def _to_hhmmss(t: float) -> str:
+        t = max(0.0, float(t))
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    @staticmethod
+    def _segment_speaker(seg: dict) -> str:
+        # Prefer segment-level speaker; fall back to majority word speaker; else UNK
+        spk = seg.get("speaker")
+        if spk:
+            return spk
+        counts = {}
+        for w in seg.get("words") or []:
+            sw = w.get("speaker")
+            if sw:
+                counts[sw] = counts.get(sw, 0) + 1
+        return max(counts, key=counts.get) if counts else "UNK"
+
+    def write_result(self, result: dict, file: TextIO, options: dict):
+        for seg in result.get("segments", []):
+            start = self._to_hhmmss(seg.get("start", 0.0))
+            end = self._to_hhmmss(seg.get("end", 0.0))
+            spk = self._segment_speaker(seg)
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            print(f"[{start} - {end}] {spk}: {text}", file=file, flush=True)
+
+
 class WriteAudacity(ResultWriter):
     """
     Write a transcript to a text file that audacity can import as labels.
@@ -449,6 +484,7 @@ def get_writer(
         "srt": WriteSRT,
         "tsv": WriteTSV,
         "json": WriteJSON,
+        "spk": WriteSPK,
     }
     optional_writers = {
         "aud": WriteAudacity,
