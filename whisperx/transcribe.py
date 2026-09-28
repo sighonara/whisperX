@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import os
 import warnings
 from typing import Optional
@@ -69,6 +70,10 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     print_progress: bool = args.pop("print_progress")
     return_speaker_embeddings: bool = args.pop("speaker_embeddings")
     interleaved_context: bool = args.pop("interleaved_context", False)
+    diarize_from_json: str = args.pop("diarize_from_json")
+    if diarize_from_json and not diarize:
+        logger.info("--diarize_from_json given, enabling diarization automatically")
+        diarize = True
 
     if return_speaker_embeddings and not diarize:
         warnings.warn("--speaker_embeddings has no effect without --diarize")
@@ -127,93 +132,131 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         warnings.warn("--max_line_count has no effect without --max_line_width")
     writer_args = {arg: args.pop(arg) for arg in word_options}
 
-    # Part 1: VAD & ASR Loop
+    audio_paths = args.pop("audio")
     results = []
-    # model = load_model(model_name, device=device, download_root=model_dir)
-    model = load_model(
-        model_name,
-        device=device,
-        device_index=device_index,
-        download_root=model_dir,
-        compute_type=compute_type,
-        language=args["language"],
-        asr_options=asr_options,
-        vad_method=vad_method,
-        vad_options={
-            "chunk_size": chunk_size,
-            "vad_onset": vad_onset,
-            "vad_offset": vad_offset,
-        },
-        task=task,
-        local_files_only=model_cache_only,
-        threads=faster_whisper_threads,
-        use_auth_token=hf_token,
-    )
 
-    for audio_path in args.pop("audio"):
-        audio = load_audio(audio_path)
-        # >> VAD & ASR
-        logger.info("Performing transcription...")
-        result: TranscriptionResult = model.transcribe(
-            audio,
-            batch_size=batch_size,
-            chunk_size=chunk_size,
-            print_progress=print_progress,
-            verbose=verbose,
-            interleaved_context=interleaved_context,
+    if diarize_from_json:
+        if len(audio_paths) != 1:
+            parser.error("--diarize_from_json only supports a single audio file")
+        logger.info(f"Loading transcript checkpoint from {diarize_from_json}, skipping ASR and alignment...")
+        with open(diarize_from_json, "r", encoding="utf-8") as f:
+            checkpoint: AlignedTranscriptionResult = json.load(f)
+        # Drop any speaker labels already in the checkpoint. assign_word_speakers
+        # only overwrites segments the new diarization actually overlaps, so stale
+        # labels from a previous (possibly different model) run would survive and
+        # silently mix with the new ones under the same names.
+        stripped = 0
+        for seg in checkpoint.get("segments", []):
+            if seg.pop("speaker", None) is not None:
+                stripped += 1
+            for w in seg.get("words") or []:
+                w.pop("speaker", None)
+        for w in checkpoint.get("word_segments") or []:
+            w.pop("speaker", None)
+        checkpoint.pop("speaker_embeddings", None)
+        if stripped:
+            logger.info(f"Cleared {stripped} pre-existing segment speaker labels from checkpoint")
+        results = [(checkpoint, audio_paths[0])]
+    else:
+        # Part 1: VAD & ASR Loop
+        # model = load_model(model_name, device=device, download_root=model_dir)
+        model = load_model(
+            model_name,
+            device=device,
+            device_index=device_index,
+            download_root=model_dir,
+            compute_type=compute_type,
+            language=args["language"],
+            asr_options=asr_options,
+            vad_method=vad_method,
+            vad_options={
+                "chunk_size": chunk_size,
+                "vad_onset": vad_onset,
+                "vad_offset": vad_offset,
+            },
+            task=task,
+            local_files_only=model_cache_only,
+            threads=faster_whisper_threads,
+            use_auth_token=hf_token,
         )
-        results.append((result, audio_path))
 
-    # Unload Whisper and VAD
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # Part 2: Align Loop
-    if not no_align:
-        tmp_results = results
-        results = []
-        align_model, align_metadata = load_align_model(
-            align_language, device, model_name=align_model, model_dir=model_dir, model_cache_only=model_cache_only
-        )
-        for result, audio_path in tmp_results:
-            # >> Align
-            if len(tmp_results) > 1:
-                input_audio = audio_path
-            else:
-                # lazily load audio from part 1
-                input_audio = audio
-
-            if align_model is not None and len(result["segments"]) > 0:
-                if result.get("language", "en") != align_metadata["language"]:
-                    # load new language
-                    logger.info(
-                        f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language..."
-                    )
-                    align_model, align_metadata = load_align_model(
-                        result["language"], device, model_dir=model_dir, model_cache_only=model_cache_only
-                    )
-                logger.info("Performing alignment...")
-                result: AlignedTranscriptionResult = align(
-                    result["segments"],
-                    align_model,
-                    align_metadata,
-                    input_audio,
-                    device,
-                    interpolate_method=interpolate_method,
-                    return_char_alignments=return_char_alignments,
-                    print_progress=print_progress,
-                )
-
+        for audio_path in audio_paths:
+            audio = load_audio(audio_path)
+            # >> VAD & ASR
+            logger.info("Performing transcription...")
+            result: TranscriptionResult = model.transcribe(
+                audio,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                print_progress=print_progress,
+                verbose=verbose,
+                interleaved_context=interleaved_context,
+            )
             results.append((result, audio_path))
 
-        # Unload align model
-        del align_model
+        # Unload Whisper and VAD
+        del model
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Part 2: Align Loop
+        if not no_align:
+            tmp_results = results
+            results = []
+            align_model, align_metadata = load_align_model(
+                align_language, device, model_name=align_model, model_dir=model_dir, model_cache_only=model_cache_only
+            )
+            for result, audio_path in tmp_results:
+                # >> Align
+                if len(tmp_results) > 1:
+                    input_audio = audio_path
+                else:
+                    # lazily load audio from part 1
+                    input_audio = audio
+
+                if align_model is not None and len(result["segments"]) > 0:
+                    if result.get("language", "en") != align_metadata["language"]:
+                        # load new language
+                        logger.info(
+                            f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language..."
+                        )
+                        align_model, align_metadata = load_align_model(
+                            result["language"], device, model_dir=model_dir, model_cache_only=model_cache_only
+                        )
+                    logger.info("Performing alignment...")
+                    result: AlignedTranscriptionResult = align(
+                        result["segments"],
+                        align_model,
+                        align_metadata,
+                        input_audio,
+                        device,
+                        interpolate_method=interpolate_method,
+                        return_char_alignments=return_char_alignments,
+                        print_progress=print_progress,
+                    )
+
+                results.append((result, audio_path))
+
+            # Unload align model
+            del align_model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def write_results(results_to_write):
+        for result, audio_path in results_to_write:
+            result["language"] = align_language
+            writer(result, audio_path, writer_args)
+
     # >> Diarize
     if diarize:
+        if not diarize_from_json:
+            # Checkpoint before the memory-heavy diarization step, so a crash there
+            # does not lose the ASR and alignment work. These files are overwritten
+            # below once diarization succeeds. Rerun with --diarize_from_json
+            # pointed at the JSON to retry diarization without redoing ASR.
+            logger.info("Checkpoint: writing transcript before diarization...")
+            write_results(results)
+
         if hf_token is None:
             logger.warning(
                 "No --hf_token provided, needs to be saved in environment variable, otherwise will throw error loading diarization model"
@@ -245,6 +288,4 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             result = assign_word_speakers(diarize_segments, result, speaker_embeddings)
             results.append((result, input_audio_path))
     # >> Write
-    for result, audio_path in results:
-        result["language"] = align_language
-        writer(result, audio_path, writer_args)
+    write_results(results)

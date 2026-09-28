@@ -49,6 +49,7 @@ def cli():
     parser.add_argument("--max_speakers", default=None, type=int, help="Maximum number of speakers to in audio file")
     parser.add_argument("--diarize_model", default="pyannote/speaker-diarization-community-1", type=str, help="Name of the speaker diarization model to use")
     parser.add_argument("--speaker_embeddings", action="store_true", help="Include speaker embeddings in JSON output (only works with --diarize)")
+    parser.add_argument("--diarize_from_json", type=str, default=None, help="Path to a previously saved WhisperX JSON transcript (e.g. the checkpoint written before diarization) to diarize directly, skipping ASR and alignment. Implies --diarize. Only supports a single audio file.")
 
     parser.add_argument("--temperature", type=float, default=0, help="temperature to use for sampling")
     parser.add_argument("--best_of", type=optional_int, default=5, help="number of candidates when sampling with non-zero temperature")
